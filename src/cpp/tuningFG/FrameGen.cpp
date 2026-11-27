@@ -30,6 +30,8 @@ constexpr int      kMaxLevels   = 6;
 constexpr int      kMaxGen      = 4;
 // Frames of the next pair are written while the previous pair still has presents queued.
 constexpr int      kGenImages   = 10;
+// Extra presents one X++ Draw can have in flight, each with its own fence.
+constexpr int      kSide        = kMaxGen - 1;
 constexpr uint32_t kMinLevelDim = 24;  // coarsest pyramid level is at least this large
 constexpr uint32_t kBlock       = 8;   // motion block size in pixels of each level
 constexpr uint32_t kStamps      = 5;   // start, pyramid, motion, select, end
@@ -45,11 +47,12 @@ constexpr double   kDynOnRatio  = 0.92;
 constexpr double   kDynOffRatio = 0.98;
 constexpr int      kDynOnVotes  = 8;
 constexpr int      kDynOffVotes = 60;
-// A real frame is shown raw on the one vsync whose content time falls inside
-// this share of a refresh of the frame. The other vsyncs of the gap are
-// interpolated, so a frame is never replaced by a blend and never repeated
-// for the rest of its interval.
+// The playout may run this share of a refresh past the newest frame before it brakes.
 constexpr double   kSnapRefresh = 0.5;
+// A real frame within this share of a refresh of the content time is shown as
+// is instead of a blend, without moving the timeline. About 3 ms at 60 Hz;
+// half a refresh (8 ms) read as a hitch on a turn.
+constexpr double   kRawRefresh  = 0.2;
 constexpr double   kMaxHoldMs   = 100.0;
 // Performance playout: the shown content time follows (vsync - hold) at a speed
 // within 1 +- kSpeedRange, correcting its error over about kCatchMs, so a change
@@ -289,13 +292,14 @@ struct FrameGenState {
     bool     slotPresented = false;
     uint32_t heldCf = 0;
     uint32_t heldImg = 0;
-    // The extra present of a Draw. Draw is still watching the slot above, so
-    // this image cannot reuse that slot's semaphore: acquiring with it waits
+    // The extra presents of a Draw. Draw is still watching the slot above, so
+    // these images cannot reuse that slot's semaphore: acquiring with it waits
     // until the compose just queued finishes, and on FIFO that is the next
     // refresh. A separate semaphore can take a free image immediately.
-    VkCommandBuffer sideCmd = VK_NULL_HANDLE;
-    VkSemaphore     sideAcquire = VK_NULL_HANDLE;
-    VkFence         sideFence = VK_NULL_HANDLE;
+    VkCommandBuffer sideCmd[kSide] = {};
+    VkSemaphore     sideAcquire[kSide] = {};
+    VkFence         sideFence[kSide] = {};
+    int             sideHead = 0;
 
     // Ring and timing
     int  prevSlot = -1, curSlot = -1;
@@ -410,9 +414,9 @@ struct FrameGenState {
                      bool withCursorUpload, VkSemaphore extraWait);
     // The context waits on imgInFlight with no timeout. A destroyed sideFence
     // left there hangs the next normal frame after frame gen is turned off.
-    void forgetSideFence(VulkanRendererContext* c) {
-        if (sideFence == VK_NULL_HANDLE) return;
-        for (auto& owner : c->imgInFlight) if (owner == sideFence) owner = VK_NULL_HANDLE;
+    void forgetSideFence(VulkanRendererContext* c, VkFence fence) {
+        if (fence == VK_NULL_HANDLE) return;
+        for (auto& owner : c->imgInFlight) if (owner == fence) owner = VK_NULL_HANDLE;
     }
     bool takeSwapchainImage(VulkanRendererContext* c, uint32_t cf, uint32_t& imgIdx,
                             uint64_t acquireTimeout = UINT64_MAX, uint64_t fenceTimeout = UINT64_MAX);
@@ -431,6 +435,17 @@ struct FrameGenState {
     void submitInterp(VulkanRendererContext* c, int prev, int cur, float t, int img);
     bool renderDynamic(VulkanRendererContext* c, const FrameBuild& fb, int slot,
                        Clock::time_point arrival, bool newContent, bool dupFrame, bool gap);
+    // What one vsync shows: content time x on the playout, and either the real
+    // frame rawSlot or the blend at t between dyn[fi - 1] and dyn[fi].
+    struct DynPick {
+        Clock::time_point x{};
+        int   fi = 1;
+        bool  real = true;
+        bool  atEnd = false;  // reached dyn[fi]
+        int   rawSlot = -1;
+        float t = 0.f;
+    };
+    DynPick dynPick(Clock::time_point v, double dv) const;
     int  planPhases(double intervalNow, Clock::time_point arrival, float* phases);
     void updateContentClock(Clock::time_point arrival);
     double lateQuantile(Clock::time_point now) const;
@@ -746,9 +761,11 @@ bool FrameGenState::createPipelines(VulkanRendererContext* c) {
     }
     for (int j = 0; j < kGenImages; ++j)
         if (vk.CreateFence(c->device, &fi, nullptr, &interpFence[j]) != VK_SUCCESS) return false;
-    cbs.commandBufferCount = 1;
-    if (vk.AllocateCommandBuffers(c->device, &cbs, &sideCmd) != VK_SUCCESS) return false;
-    if (vk.CreateFence(c->device, &fi, nullptr, &sideFence) != VK_SUCCESS) return false;
+    cbs.commandBufferCount = kSide;
+    if (vk.AllocateCommandBuffers(c->device, &cbs, sideCmd) != VK_SUCCESS) return false;
+    for (int i = 0; i < kSide; ++i)
+        if (vk.CreateFence(c->device, &fi, nullptr, &sideFence[i]) != VK_SUCCESS) return false;
+    sideHead = 0;
 
     if (tsValid) {
         VkQueryPoolCreateInfo qi{};
@@ -761,9 +778,11 @@ bool FrameGenState::createPipelines(VulkanRendererContext* c) {
     VkSemaphoreCreateInfo semInfo{};
     semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     if (vk.CreateSemaphore(c->device, &semInfo, nullptr, &sceneDone) != VK_SUCCESS ||
-        vk.CreateSemaphore(c->device, &semInfo, nullptr, &computeDone) != VK_SUCCESS ||
-        vk.CreateSemaphore(c->device, &semInfo, nullptr, &sideAcquire) != VK_SUCCESS)
+        vk.CreateSemaphore(c->device, &semInfo, nullptr, &computeDone) != VK_SUCCESS)
         return false;
+    for (int i = 0; i < kSide; ++i)
+        if (vk.CreateSemaphore(c->device, &semInfo, nullptr, &sideAcquire[i]) != VK_SUCCESS)
+            return false;
     return true;
 }
 
@@ -1094,13 +1113,15 @@ void FrameGenState::destroyPipelines(VulkanRendererContext* c) {
         if (interpFence[j]) vk.DestroyFence(c->device, interpFence[j], nullptr);
         interpFence[j] = VK_NULL_HANDLE;
     }
-    forgetSideFence(c);
-    if (sideFence) vk.DestroyFence(c->device, sideFence, nullptr);
-    if (sideAcquire) vk.DestroySemaphore(c->device, sideAcquire, nullptr);
-    sideFence = VK_NULL_HANDLE;
-    sideAcquire = VK_NULL_HANDLE;
-    if (sideCmd) vk.FreeCommandBuffers(c->device, c->cmdPool, 1, &sideCmd);
-    sideCmd = VK_NULL_HANDLE;
+    for (int i = 0; i < kSide; ++i) {
+        forgetSideFence(c, sideFence[i]);
+        if (sideFence[i]) vk.DestroyFence(c->device, sideFence[i], nullptr);
+        if (sideAcquire[i]) vk.DestroySemaphore(c->device, sideAcquire[i], nullptr);
+        sideFence[i] = VK_NULL_HANDLE;
+        sideAcquire[i] = VK_NULL_HANDLE;
+    }
+    if (sideCmd[0]) vk.FreeCommandBuffers(c->device, c->cmdPool, kSide, sideCmd);
+    std::memset(sideCmd, 0, sizeof(sideCmd));
     if (sceneCb[0]) vk.FreeCommandBuffers(c->device, c->cmdPool, kRing, sceneCb);
     if (fgCb[0])    vk.FreeCommandBuffers(c->device, c->cmdPool, kRing, fgCb);
     if (interpCb[0]) vk.FreeCommandBuffers(c->device, c->cmdPool, kGenImages, interpCb);
@@ -1803,19 +1824,23 @@ bool FrameGenState::presentSide(VulkanRendererContext* c, VkDescriptorSet ds,
                                 const FrameBuild& fb, bool withCursorUpload,
                                 VkSemaphore extraWait) {
     auto& vk = c->vk_;
-    if (sideCmd == VK_NULL_HANDLE || sideAcquire == VK_NULL_HANDLE || sideFence == VK_NULL_HANDLE)
+    const int side = sideHead;
+    VkCommandBuffer cmd = sideCmd[side];
+    VkSemaphore& acquireSem = sideAcquire[side];
+    VkFence& fence = sideFence[side];
+    if (cmd == VK_NULL_HANDLE || acquireSem == VK_NULL_HANDLE || fence == VK_NULL_HANDLE)
         return false;
     if (c->fbResized.load() || c->swapchain == VK_NULL_HANDLE) return false;
 
-    // Skip when the previous side fill or a swapchain image is still busy.
+    // Skip when the oldest side fill or a swapchain image is still busy.
     // Any wait here runs on the game thread and caps the source near half the
     // refresh (about 30 fps on 60 Hz) — the 30-60 lock the HUD was showing.
-    if (vk.GetFenceStatus(c->device, sideFence) != VK_SUCCESS)
+    if (vk.GetFenceStatus(c->device, fence) != VK_SUCCESS)
         return false;
 
     uint32_t imgIdx = 0;
     const VkResult acquired = vk.AcquireNextImageKHR(c->device, c->swapchain, 0,
-                                                     sideAcquire, VK_NULL_HANDLE, &imgIdx);
+                                                     acquireSem, VK_NULL_HANDLE, &imgIdx);
     if (acquired == VK_TIMEOUT || acquired == VK_NOT_READY) return false;
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR || acquired == VK_ERROR_SURFACE_LOST_KHR) {
         c->fbResized.store(true);
@@ -1828,25 +1853,25 @@ bool FrameGenState::presentSide(VulkanRendererContext* c, VkDescriptorSet ds,
         return false;
     }
 
-    // Acquire signaled sideAcquire and dequeued the image. Anything short of a
+    // Acquire signaled acquireSem and dequeued the image. Anything short of a
     // present has to drop both, or the next fill signals the semaphore twice
     // and the image never returns to the swapchain.
     auto abandon = [&]() {
-        vk.DestroySemaphore(c->device, sideAcquire, nullptr);
-        sideAcquire = VK_NULL_HANDLE;
+        vk.DestroySemaphore(c->device, acquireSem, nullptr);
+        acquireSem = VK_NULL_HANDLE;
         VkSemaphoreCreateInfo sci{};
         sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        if (vk.CreateSemaphore(c->device, &sci, nullptr, &sideAcquire) != VK_SUCCESS)
-            sideAcquire = VK_NULL_HANDLE;
-        if (vk.GetFenceStatus(c->device, sideFence) != VK_SUCCESS) {
-            forgetSideFence(c);
-            vk.DestroyFence(c->device, sideFence, nullptr);
-            sideFence = VK_NULL_HANDLE;
+        if (vk.CreateSemaphore(c->device, &sci, nullptr, &acquireSem) != VK_SUCCESS)
+            acquireSem = VK_NULL_HANDLE;
+        if (vk.GetFenceStatus(c->device, fence) != VK_SUCCESS) {
+            forgetSideFence(c, fence);
+            vk.DestroyFence(c->device, fence, nullptr);
+            fence = VK_NULL_HANDLE;
             VkFenceCreateInfo fi{};
             fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-            if (vk.CreateFence(c->device, &fi, nullptr, &sideFence) != VK_SUCCESS)
-                sideFence = VK_NULL_HANDLE;
+            if (vk.CreateFence(c->device, &fi, nullptr, &fence) != VK_SUCCESS)
+                fence = VK_NULL_HANDLE;
         }
         c->fbResized.store(true);
         c->swapchainRetryPending.store(true);
@@ -1856,7 +1881,7 @@ bool FrameGenState::presentSide(VulkanRendererContext* c, VkDescriptorSet ds,
     if (c->imgInFlight.size() != c->swapchainImages.size())
         c->imgInFlight.assign(c->swapchainImages.size(), VK_NULL_HANDLE);
 
-    vk.ResetCommandBuffer(sideCmd, 0);
+    vk.ResetCommandBuffer(cmd, 0);
     composeDraws.resize(1);
     VulkanRendererContext::DrawEntry& de = composeDraws[0];
     de = {};
@@ -1867,7 +1892,7 @@ bool FrameGenState::presentSide(VulkanRendererContext* c, VkDescriptorSet ds,
     FrameGenPass pass;
     pass.compose = true;
     try {
-        c->recordCmdBuf(sideCmd, imgIdx, composeDraws, c->frameAhbTransitions,
+        c->recordCmdBuf(cmd, imgIdx, composeDraws, c->frameAhbTransitions,
                         c->framePreUpload, c->framePostUpload,
                         fb.curUpload, withCursorUpload && fb.hasCurUpload,
                         fb.ox, fb.oy, fb.sx, fb.sy, fb.cw, fb.ch,
@@ -1877,7 +1902,7 @@ bool FrameGenState::presentSide(VulkanRendererContext* c, VkDescriptorSet ds,
         return abandon();
     }
 
-    VkSemaphore wSem[2] = {sideAcquire, extraWait};
+    VkSemaphore wSem[2] = {acquireSem, extraWait};
     VkSemaphore sSem[] = {c->renderDoneSems[imgIdx]};
     VkPipelineStageFlags wStage[2] = {
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1888,14 +1913,15 @@ bool FrameGenState::presentSide(VulkanRendererContext* c, VkDescriptorSet ds,
     si.pWaitSemaphores = wSem;
     si.pWaitDstStageMask = wStage;
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &sideCmd;
+    si.pCommandBuffers = &cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = sSem;
 
-    vk.ResetFences(c->device, 1, &sideFence);
-    if (vk.QueueSubmit(c->graphicsQueue, 1, &si, sideFence) != VK_SUCCESS)
+    vk.ResetFences(c->device, 1, &fence);
+    if (vk.QueueSubmit(c->graphicsQueue, 1, &si, fence) != VK_SUCCESS)
         return abandon();
-    c->imgInFlight[imgIdx] = sideFence;
+    c->imgInFlight[imgIdx] = fence;
+    sideHead = (side + 1) % kSide;
 
     VkSwapchainKHR scs[] = {c->swapchain};
     VkPresentInfoKHR pi{};
@@ -2429,11 +2455,50 @@ bool FrameGenState::renderFrame(VulkanRendererContext* c) {
     return true;
 }
 
+// Performance: the image of vsync v. dynX follows (v - hold) at a speed within
+// 1 +- kSpeedRange, brakes near the newest frame and jumps after a hitch. The
+// image is the content at x, so a rotation moves the same distance every
+// refresh. A real frame is shown as is only within kRawRefresh of x.
+FrameGenState::DynPick FrameGenState::dynPick(Clock::time_point v, double dv) const {
+    auto ms = [](double d) {
+        return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(d));
+    };
+    const double p = vsyncPeriodMs();
+    const DynFrame& last = dyn[dynCount - 1];
+    const auto limit = last.ct + ms(kSnapRefresh * p);
+    const auto desired = v - ms(holdMs);
+    DynPick r;
+    const double err = msBetween(dynX + ms(dv), desired);
+    if (!haveDynX || err > kJumpMs) {
+        r.x = std::min(desired, last.ct);
+    } else {
+        const double s = 1.0 + std::clamp(err / kCatchMs, -kSpeedRange, kSpeedRange);
+        r.x = dynX + ms(dv * s);
+        if (r.x > limit) r.x = dynX + ms(kBrake * std::max(0.0, msBetween(dynX, limit)));
+    }
+    if (haveDynX && r.x < dynX) r.x = dynX;
+
+    int fi = 1;
+    while (fi < dynCount - 1 && dyn[fi].ct <= r.x) ++fi;
+    r.fi = fi;
+    const DynFrame& a = dyn[fi - 1];
+    const DynFrame& f = dyn[fi];
+    const double span = std::max(1.0, msBetween(a.ct, f.ct));
+    const double t = msBetween(a.ct, r.x) / span;
+    const double tol = kRawRefresh * p / span;
+    r.t = (float)std::clamp(t, 0.0, 1.0);
+    r.atEnd = t >= 1.0 - tol;
+    // A cut has no field to blend.
+    if (f.cut || !f.paired || r.atEnd) r.rawSlot = f.slot;
+    else if (t <= tol) r.rawSlot = a.slot;
+    else r.real = false;
+    return r;
+}
+
 // Performance: motion is estimated once per real frame. Every vsync shows the
-// content time dynX, one refresh of it per refresh, interpolated between the
-// two real frames around it. A real frame is shown raw only when dynX is on
-// it; showing it earlier jumps a rotation. The game is not capped.
-// Returns when a new frame arrives or there is nothing newer to show.
+// content time dynX (see dynPick). The game is not capped.
+// Java: returns when a new frame arrives or there is nothing newer to show.
+// X++: queues the vsyncs up to the next game frame and returns.
 bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb, int slot,
                                   Clock::time_point arrival, bool newContent, bool dupFrame,
                                   bool gap) {
@@ -2443,7 +2508,6 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
     };
     const double p = vsyncPeriodMs();
     const double lead = presentLeadMs();
-    const double snap = kSnapRefresh * p;
     pyrValid[slot] = false;
 
     bool cursorUpload = true;
@@ -2458,9 +2522,8 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         return ok;
     };
     auto finish = [&]() {
-        // The X++ image was acquired before this loop. Dropping it leaves a
+        // The X++ image was acquired before this call. Dropping it leaves a
         // signaled semaphore with no submit, and the swapchain is recreated.
-        // A newer game frame woke the wait: show this capture unchanged.
         if (heldAcquire) present(composeScene[slot]);
         if (waitScene) {
             VkPipelineStageFlags stg = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
@@ -2484,8 +2547,14 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
     }
     Clock::time_point base;
     const bool grid = vsyncBase(base);
+    // X++ also draws for the cursor and small windows. Restarting there jumped
+    // to the newest frame; it is one more vsync of the same playout. After the
+    // same gap Java stops skipping redraws, the capture is shown.
+    const bool xppRedraw = holdSlot && !newContent && kApplied == 1 && haveDynX && dynCount > 0 &&
+                           haveArrival && intervalMs > 0.0 &&
+                           msBetween(lastArrival, arrival) < intervalMs * 2.5;
 
-    if (overloaded || !grid || !(dupFrame || (newContent && gen))) {
+    if (overloaded || !grid || !(dupFrame || (newContent && gen) || xppRedraw)) {
         // Shown as is: generation off, a redraw, or no vsync timing.
         restartDyn(slot, haveClock ? contentTime : arrival);
         haveFieldPrev = false;
@@ -2494,9 +2563,8 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         return finish();
     }
 
-    // Motion estimation of new frames waits until right after the next present:
-    // the vsyncs just ahead still show older pairs, and queued in front of
-    // their interpolation it would make them miss the latch.
+    // A pair is estimated right before its first blend. Earlier, it would sit
+    // in front of the blends of older pairs and make them miss the latch.
     auto flushAnalysis = [&]() {
         for (int i = 1; i < dynCount; ++i) {
             if (!dyn[i].pending) continue;
@@ -2510,7 +2578,7 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         DynFrame& f = dyn[dynCount - 1];
         f.slot = slot;
         f.paired = f.pending = f.paired && dynCount >= 2;
-    } else {
+    } else if (newContent) {
         // A late frame is still on the content clock, so morphing into it keeps
         // the timing; only a freeze too long for motion estimation is a cut.
         const bool cut = msBetween(dyn[dynCount - 1].ct, contentTime) > kMaxMorphMs;
@@ -2520,9 +2588,11 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         // One content interval of hold: the next frame is already captured
         // when this one is shown, so the refreshes between them keep moving.
         // Less than that shows the frame early and the following vsyncs repeat it.
+        // X++ estimates the new pair inside the hold, before its first blend.
         const double cover = clockIvMs > 0.0 ? clockIvMs : lateMs;
         const double late = std::min(std::max(lateMs, cover), kMaxLateIntervals * cover);
-        holdMs = std::min(late + lead + kQueueMs, kMaxHoldMs);
+        const double pipe = holdSlot ? gpuMsEma + interpMsEma : 0.0;
+        holdMs = std::min(late + lead + pipe + kQueueMs, kMaxHoldMs);
     }
 
     int made = 0;
@@ -2530,84 +2600,77 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         if (newContent && !dupFrame) lastK = made;
         return finish();
     };
+    auto noteShown = [&](const DynPick& pk, Clock::time_point v) {
+        const DynFrame& a = dyn[pk.fi - 1];
+        const DynFrame& f = dyn[pk.fi];
+        if (a.ct <= pk.x && dynRealCt < a.ct) dynRealCt = a.ct;
+        if (pk.real) {
+            const auto rawCt = pk.rawSlot == f.slot ? f.ct : a.ct;
+            if (dynRealCt < rawCt) dynRealCt = rawCt;
+        } else {
+            ++made;
+        }
+        dynStalled = false;
+        dynX = pk.x;
+        dynV = v;
+        haveDynX = haveDynV = true;
+        const double added = std::max(0.0, msBetween(pk.x, v) - 0.5 * p - kLatchMs);
+        latencyEma = latencyEma > 0.0 ? latencyEma * 0.95 + added * 0.05 : added;
+    };
 
-    // X++ copies this frame and queues one blend for the next refresh, then
-    // returns. Staying here until the next game frame lets that frame reuse
-    // its buffer and replaces the blend with the raw capture.
+    // X++ only draws when the scene changes, and sleeping here would let the
+    // game reuse the buffer of its next frame. The vsyncs up to that frame are
+    // queued now, each with the content time of its own vsync, so the FIFO
+    // holds about one image and a missed vsync does not shift the timeline.
     if (holdSlot) {
-        if (!vsyncBase(base)) return done();
         dynTrim();
         if (dynCount < 2) {
             dynStalled = true;
             return done();
         }
         const auto now = Clock::now();
-        const Clock::time_point v = vsyncAtOrAfter(base, now + ms(lead));
-        Clock::time_point x = haveDynX ? dynX + ms(p) : dyn[dynCount - 2].ct;
-        if (x > dyn[dynCount - 1].ct) x = dyn[dynCount - 1].ct;
-
-        auto vectorReady = [&](int i) {
-            const DynFrame& fr = dyn[i];
-            return fr.paired && !fr.cut && !fr.pending &&
-                   vk.GetFenceStatus(c->device, fgFence[fr.slot]) == VK_SUCCESS;
-        };
-        int fi = 1;
-        while (fi < dynCount - 1 && dyn[fi].ct <= x) ++fi;
-        if (!vectorReady(fi)) {
-            int prev = fi - 1;
-            while (prev >= 1 && !vectorReady(prev)) --prev;
-            if (prev >= 1) {
-                fi = prev;
-                if (x > dyn[fi].ct) x = dyn[fi].ct;
+        const double iv = clockIvMs > 0.0 ? clockIvMs : intervalMs;
+        const double untilFrame = std::max(0.0, iv - msBetween(lastArrival, now));
+        const auto end = vsyncAtOrAfter(base, now + ms(untilFrame + lead));
+        Clock::time_point v = vsyncAtOrAfter(base, now + ms(lead));
+        if (haveDynV) v = std::max(v, nearestVsync(base, dynV + ms(p)));
+        for (int step = 0; step < kMaxGen && (step == 0 || v < end); ++step) {
+            const double dv = haveDynV && !dynStalled ? std::max(p, msBetween(dynV, v)) : p;
+            DynPick pk = dynPick(v, dv);
+            const DynFrame& a = dyn[pk.fi - 1];
+            const DynFrame& f = dyn[pk.fi];
+            // The field of a new pair cannot finish before this vsync.
+            if (!pk.real && f.pending &&
+                msBetween(Clock::now(), v) < gpuMsEma + interpMsEma + kLatchMs + 1.0) {
+                pk.real = true;
+                pk.atEnd = false;
+                pk.rawSlot = a.slot;
             }
-        }
-        const bool ready = vectorReady(fi);
-        if (!ready && dynShown != VK_NULL_HANDLE) {
-            present(dynShown);
-            flushAnalysis();
-            return done();
-        }
-
-        // One step on a pair whose vector has finished. The refresh after this
-        // one is queued only when the game will not deliver a frame first.
-        const double untilFrame = intervalMs - msBetween(lastArrival, now);
-        const int ahead = untilFrame > p ? 1 : 0;
-        for (int step = 0; step <= ahead; ++step) {
-            if (step == 1) {
-                x = x + ms(p);
-                if (x > dyn[dynCount - 1].ct) x = dyn[dynCount - 1].ct;
-                fi = 1;
-                while (fi < dynCount - 1 && dyn[fi].ct <= x) ++fi;
-                if (!vectorReady(fi)) {
-                    int prev = fi - 1;
-                    while (prev >= 1 && !vectorReady(prev)) --prev;
-                    if (prev >= 1) {
-                        fi = prev;
-                        if (x > dyn[fi].ct) x = dyn[fi].ct;
-                    }
+            VkDescriptorSet ds = pk.real ? composeScene[pk.rawSlot] : VK_NULL_HANDLE;
+            if (ds != VK_NULL_HANDLE && ds == dynShown) {
+                // Caught up to the newest frame: wait for the game.
+                if (pk.atEnd && pk.fi == dynCount - 1) {
+                    dynX = pk.x;
+                    dynV = v;
+                    haveDynX = haveDynV = true;
+                    dynStalled = true;
+                } else if (step == 0) {
+                    noteShown(pk, v);
                 }
-                if (!vectorReady(fi)) break;
+                // The FIFO keeps showing it; queuing it again only adds depth.
+                // The held image still has to be presented.
+                if (step == 0 && heldAcquire) present(ds);
+                break;
             }
-            const DynFrame& a = dyn[std::max(0, fi - 1)];
-            const DynFrame& f = dyn[fi];
-            Clock::time_point at = x;
-            if (!vectorReady(fi)) at = a.ct;
-            if (a.ct <= at && dynRealCt < a.ct) dynRealCt = a.ct;
-            const double span = std::max(1.0, msBetween(a.ct, f.ct));
-            const double t = msBetween(a.ct, at) / span;
-            const bool pairReady = vectorReady(fi);
-            VkDescriptorSet ds = composeScene[pairReady ? f.slot : a.slot];
-            const bool real = !pairReady || f.cut || !f.paired || t <= 0.0 || t >= 1.0;
-            if (real && t <= 0.0 && pairReady && !f.cut && f.paired) ds = composeScene[a.slot];
-            if (!real) {
+            if (!pk.real) {
+                if (f.pending) flushAnalysis();
                 const int genImg = genHead;
                 genHead = (genHead + 1) % kGenImages;
                 ds = composeGen[genImg];
-                submitInterp(c, a.slot, f.slot, (float)std::clamp(t, 0.0, 1.0), genImg);
-                ++made;
+                submitInterp(c, a.slot, f.slot, pk.t, genImg);
             }
             bool shown = false;
-            if (step == 0 || heldAcquire) {
+            if (heldAcquire) {
                 shown = present(ds);
             } else if (presentSide(c, ds, fb, cursorUpload, waitScene ? sceneDone : VK_NULL_HANDLE)) {
                 waitScene = false;
@@ -2616,18 +2679,10 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
                 shown = true;
             }
             if (!shown) break;
-            x = at;
-            if (pairReady && real && dynRealCt < f.ct && ds == composeScene[f.slot])
-                dynRealCt = f.ct;
-            if (step == 1 && x >= dyn[fi].ct) break;
+            noteShown(pk, v);
+            v = nearestVsync(base, v + ms(p));
         }
-        dynStalled = false;
-        dynX = x;
-        dynV = v;
-        haveDynX = haveDynV = true;
         flushAnalysis();
-        const double added = std::max(0.0, msBetween(x, v) - 0.5 * p - kLatchMs);
-        latencyEma = latencyEma > 0.0 ? latencyEma * 0.95 + added * 0.05 : added;
         return done();
     }
 
@@ -2642,109 +2697,56 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         const auto now = Clock::now();
         Clock::time_point v = haveDynV ? nearestVsync(base, dynV + ms(p))
                                        : vsyncAtOrAfter(base, now + ms(lead));
-        // A vsync is skipped only when this present cannot reach it. On X++ the
-        // acquire of every image after the first one blocks until the refresh,
-        // so that wait is not added on top of the lead.
-        const bool blockingAcquire = holdSlot && !heldAcquire;
-        const double minAhead = kLatchMs + 2.0 + (blockingAcquire ? 0.0 : interpMsEma);
+        // A vsync is skipped only when this present cannot reach it.
+        const double minAhead = kLatchMs + 2.0 + interpMsEma;
         if (msBetween(now, v) < minAhead) v = vsyncAtOrAfter(base, now + ms(minAhead));
 
-        // Decide the image before waiting. A real frame that lands while waiting
-        // is captured at once: presenting here would block that copy and drop it.
-        const DynFrame& last = dyn[dynCount - 1];
-        const auto limit = last.ct + ms(snap);
-        const auto desired = v - ms(holdMs);
         const double dv = haveDynV && !dynStalled ? std::max(p, msBetween(dynV, v)) : p;
-        Clock::time_point x;
-        const double err = msBetween(dynX + ms(dv), desired);
-        if (!haveDynX || err > kJumpMs) {
-            x = std::min(desired, last.ct);
-        } else {
-            const double s = 1.0 + std::clamp(err / kCatchMs, -kSpeedRange, kSpeedRange);
-            x = dynX + ms(dv * s);
-            if (x > limit) x = dynX + ms(kBrake * std::max(0.0, msBetween(dynX, limit)));
-        }
-        if (haveDynX && x < dynX) x = dynX;
-
-        // The pair that brackets x. The image is always the content at x, so a
-        // rotation moves the same distance every refresh. Showing the raw frame
-        // on a vsync up to half a refresh away jumped that step (about 8 ms one
-        // refresh and 25 the next) and dropped the motion in between.
-        int fi = 1;
-        while (fi < dynCount - 1 && dyn[fi].ct <= x) ++fi;
-        const DynFrame& a = dyn[fi - 1];
-        const DynFrame& f = dyn[fi];
-        if (a.ct <= x && dynRealCt < a.ct) dynRealCt = a.ct;
-        const double span = std::max(1.0, msBetween(a.ct, f.ct));
-        const double t = msBetween(a.ct, x) / span;
-        VkDescriptorSet ds = composeScene[f.slot];
-        bool wantInterp = false, needField = false;
-        int slotA = -1, slotB = -1, genImg = -1;
-        float interpT = 0.f;
-        // Raw only at an endpoint, where it is the same picture as the blend:
-        // t = 0 is frame a, t = 1 is frame f. A cut has no field to blend.
-        bool real = f.cut || !f.paired || t <= 0.0 || t >= 1.0;
-        if (real && t <= 0.0 && !f.cut && f.paired) ds = composeScene[a.slot];
+        const DynPick pk = dynPick(v, dv);
+        const DynFrame& a = dyn[pk.fi - 1];
+        const DynFrame& f = dyn[pk.fi];
+        if (a.ct <= pk.x && dynRealCt < a.ct) dynRealCt = a.ct;
+        VkDescriptorSet ds = pk.real ? composeScene[pk.rawSlot] : VK_NULL_HANDLE;
         // Caught up to the newest frame: hold it. Presenting it again repeats
         // the same image for the rest of the gap.
-        if (real && ds == dynShown && fi == dynCount - 1 && t >= 1.0) {
-            dynX = x;
+        if (pk.real && pk.atEnd && ds == dynShown && pk.fi == dynCount - 1) {
+            dynX = pk.x;
             dynV = v;
             haveDynX = haveDynV = true;
             dynStalled = true;
             break;
         }
-        if (!real) {
-            wantInterp = true;
-            needField = f.pending;
-            slotA = a.slot;
-            slotB = f.slot;
-            interpT = (float)std::clamp(t, 0.0, 1.0);
-        }
+
+        // Decide the image before waiting. A real frame that lands while waiting
+        // is captured at once: presenting here would block that copy and drop it.
+        const bool needField = !pk.real && f.pending;
+        const int slotA = a.slot, slotB = f.slot;
+        int genImg = -1;
         auto copyInterp = [&]() {
-            if (!wantInterp || genImg >= 0) return;
+            if (pk.real || genImg >= 0) return;
             if (needField) flushAnalysis();
             genImg = genHead;
             genHead = (genHead + 1) % kGenImages;
             ds = composeGen[genImg];
-            submitInterp(c, slotA, slotB, interpT, genImg);
+            submitInterp(c, slotA, slotB, pk.t, genImg);
         };
         // Copy ahead only while the next real frame is not due. Queued in front
         // of its capture, the copy would make that frame miss.
         const double copyMs = (needField ? gpuMsEma : 0.0) + interpMsEma + 3.0;
         const double untilFrame = intervalMs - msBetween(lastArrival, now);
-        if (wantInterp && untilFrame > copyMs) copyInterp();
+        if (!pk.real && untilFrame > copyMs) copyInterp();
 
-        // The held image is paced to its vsync. A later image is queued a
-        // refresh ahead of its own, so the panel never waits for it, but no
-        // further: a frame arriving meanwhile is captured at once and the next
-        // call goes on from the same point of the timeline.
+        // The image is paced to its vsync. A frame arriving meanwhile is
+        // captured at once and the next call goes on from the same point.
         if (contentSerial.load(std::memory_order_relaxed) != lastSerial) return done();
-        const auto due = v - ms(lead + (blockingAcquire ? p : 0.0));
+        const auto due = v - ms(lead);
         while (Clock::now() < due)
             if (!paceUntil(due)) return done();
         copyInterp();
 
-        dynStalled = false;
-        dynX = x;
-        dynV = v;
-        haveDynX = haveDynV = true;
-        if (ds != dynShown) {
-            if (blockingAcquire) {
-                if (!presentSide(c, ds, fb, cursorUpload, waitScene ? sceneDone : VK_NULL_HANDLE))
-                    break;
-                waitScene = false;
-                cursorUpload = false;
-                dynShown = ds;
-            } else {
-                present(ds);
-            }
-        }
-        if (real && dynRealCt < f.ct && ds == composeScene[f.slot]) dynRealCt = f.ct;
-        if (wantInterp) ++made;
+        if (ds != dynShown) present(ds);
+        noteShown(pk, v);
         flushAnalysis();
-        const double added = std::max(0.0, msBetween(x, v) - 0.5 * p - kLatchMs);
-        latencyEma = latencyEma > 0.0 ? latencyEma * 0.95 + added * 0.05 : added;
     }
     return done();
 }
@@ -2765,7 +2767,13 @@ static FrameGenState* ensureState(VulkanRendererContext* c) {
     return expected;
 }
 
-bool VulkanRendererFrameGenRender(VulkanRendererContext* c) {
+#if defined(FG_TUNING_BUILD)
+#define FG_HOOK(name) FgTuning_##name
+#else
+#define FG_HOOK(name) VulkanRendererFrameGen##name
+#endif
+
+bool FG_HOOK(Render)(VulkanRendererContext* c) {
     FrameGenState* st = stateOf(c);
     if (!st) return false;
 
@@ -2814,7 +2822,7 @@ bool VulkanRendererFrameGenRender(VulkanRendererContext* c) {
     return false;
 }
 
-void VulkanRendererFrameGenNoteContent(VulkanRendererContext* c, int w, int h) {
+void FG_HOOK(NoteContent)(VulkanRendererContext* c, int w, int h) {
     FrameGenState* st = stateOf(c);
     if (!st || !st->enabled.load(std::memory_order_relaxed)) return;
     const float area = (float)w * (float)h;
@@ -2822,7 +2830,7 @@ void VulkanRendererFrameGenNoteContent(VulkanRendererContext* c, int w, int h) {
         st->contentSerial.fetch_add(1, std::memory_order_relaxed);
 }
 
-void VulkanRendererFrameGenConfigure(VulkanRendererContext* c, bool enabled, int mode, int quality,
+void FG_HOOK(Configure)(VulkanRendererContext* c, bool enabled, int mode, int quality,
                                      int multiplier, float targetHz) {
     if (!c) return;
     FrameGenState* st = ensureState(c);
@@ -2839,7 +2847,7 @@ void VulkanRendererFrameGenConfigure(VulkanRendererContext* c, bool enabled, int
     c->dirtyCV.notify_one();
 }
 
-FrameGenStats VulkanRendererFrameGenGetStats(VulkanRendererContext* c) {
+FrameGenStats FG_HOOK(GetStats)(VulkanRendererContext* c) {
     FrameGenStats out;
     FrameGenState* st = c ? stateOf(c) : nullptr;
     if (!st) return out;
@@ -2849,19 +2857,19 @@ FrameGenStats VulkanRendererFrameGenGetStats(VulkanRendererContext* c) {
     return out;
 }
 
-void VulkanRendererFrameGenNoteVsync(int64_t frameTimeNs) {
+void FG_HOOK(NoteVsync)(int64_t frameTimeNs) {
     gVsyncNs.store(frameTimeNs, std::memory_order_relaxed);
 }
 
-bool VulkanRendererFrameGenSourceUncapped() {
+bool FG_HOOK(SourceUncapped)() {
     return gSourceUncapped.load(std::memory_order_relaxed);
 }
 
-int VulkanRendererFrameGenSourceCap() {
+int FG_HOOK(SourceCap)() {
     return gSourceCap.load(std::memory_order_relaxed);
 }
 
-void VulkanRendererFrameGenDestroy(VulkanRendererContext* c) {
+void FG_HOOK(Destroy)(VulkanRendererContext* c) {
     FrameGenState* st = c->tuningFrameGen.exchange(nullptr);
     if (!st) return;
     st->enabled.store(false);

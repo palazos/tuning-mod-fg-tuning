@@ -54,29 +54,29 @@ struct FrameGenStats {
 extern "C" {
 #endif
 
-FG_TUNING_EXPORT bool VulkanRendererFrameGenRender(VulkanRendererContext* ctx);
-
-// Called whenever a window receives new pixels.
-FG_TUNING_EXPORT void VulkanRendererFrameGenNoteContent(VulkanRendererContext* ctx, int width, int height);
-
-// multiplier: output frames per real frame in power saver mode (2 or 3).
-FG_TUNING_EXPORT void VulkanRendererFrameGenConfigure(VulkanRendererContext* ctx, bool enabled, int mode,
+// Plugin build exports FgTuning_* so they never collide with libfg_loader stubs
+// that keep the VulkanRendererFrameGen* names the renderer already calls.
+#if defined(FG_TUNING_BUILD)
+FG_TUNING_EXPORT bool FgTuning_Render(VulkanRendererContext* ctx);
+FG_TUNING_EXPORT void FgTuning_NoteContent(VulkanRendererContext* ctx, int width, int height);
+FG_TUNING_EXPORT void FgTuning_Configure(VulkanRendererContext* ctx, bool enabled, int mode,
+                                         int quality, int multiplier, float targetHz);
+FG_TUNING_EXPORT FrameGenStats FgTuning_GetStats(VulkanRendererContext* ctx);
+FG_TUNING_EXPORT void FgTuning_NoteVsync(int64_t frameTimeNs);
+FG_TUNING_EXPORT bool FgTuning_SourceUncapped();
+FG_TUNING_EXPORT int FgTuning_SourceCap();
+FG_TUNING_EXPORT void FgTuning_Destroy(VulkanRendererContext* ctx);
+#else
+bool VulkanRendererFrameGenRender(VulkanRendererContext* ctx);
+void VulkanRendererFrameGenNoteContent(VulkanRendererContext* ctx, int width, int height);
+void VulkanRendererFrameGenConfigure(VulkanRendererContext* ctx, bool enabled, int mode,
                                      int quality, int multiplier, float targetHz);
-FG_TUNING_EXPORT FrameGenStats VulkanRendererFrameGenGetStats(VulkanRendererContext* ctx);
-
-// Display vsync timestamp (CLOCK_MONOTONIC ns, as given by Choreographer).
-FG_TUNING_EXPORT void VulkanRendererFrameGenNoteVsync(int64_t frameTimeNs);
-
-// Power saver X3 lifts its source cap while the image is still (loading screens).
-FG_TUNING_EXPORT bool VulkanRendererFrameGenSourceUncapped();
-
-// Frames per second the game should be held to in power saver, or 0 when the
-// user's own limit applies. X++ reads this on every Present: the cap has to
-// follow a still image without waiting for another options update.
-FG_TUNING_EXPORT int VulkanRendererFrameGenSourceCap();
-
-// Must run before the device is destroyed.
-FG_TUNING_EXPORT void VulkanRendererFrameGenDestroy(VulkanRendererContext* ctx);
+FrameGenStats VulkanRendererFrameGenGetStats(VulkanRendererContext* ctx);
+void VulkanRendererFrameGenNoteVsync(int64_t frameTimeNs);
+bool VulkanRendererFrameGenSourceUncapped();
+int VulkanRendererFrameGenSourceCap();
+void VulkanRendererFrameGenDestroy(VulkanRendererContext* ctx);
+#endif
 
 #ifdef __cplusplus
 }

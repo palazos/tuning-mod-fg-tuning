@@ -1,6 +1,6 @@
 {
   "moduleId": "fg-tuning",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minProductVersion": 23,
   "displayName": "Tuning Frame Generation",
   "description": "Tuning FG (Fixed / Dynamic / Power Saver) for Winlator.",
@@ -10,5 +10,5 @@
   "provides": ["frame-gen-tuning"],
   "uiContributions": [],
   "dex": [],
-  "nativeLibs": ["libfg_tuning.so"]
+  "nativeLibs": ["libfg_tuning.so", "libfg_tuning_xpp.so"]
 }
