@@ -66,6 +66,8 @@ FG_TUNING_EXPORT void FgTuning_NoteVsync(int64_t frameTimeNs);
 FG_TUNING_EXPORT bool FgTuning_SourceUncapped();
 FG_TUNING_EXPORT int FgTuning_SourceCap();
 FG_TUNING_EXPORT void FgTuning_Destroy(VulkanRendererContext* ctx);
+// Dynamic output rate in fps, 0 for the panel refresh. Optional: older plugins lack it.
+FG_TUNING_EXPORT void FgTuning_SetDynamicTarget(float fps);
 #else
 bool VulkanRendererFrameGenRender(VulkanRendererContext* ctx);
 void VulkanRendererFrameGenNoteContent(VulkanRendererContext* ctx, int width, int height);
@@ -76,6 +78,7 @@ void VulkanRendererFrameGenNoteVsync(int64_t frameTimeNs);
 bool VulkanRendererFrameGenSourceUncapped();
 int VulkanRendererFrameGenSourceCap();
 void VulkanRendererFrameGenDestroy(VulkanRendererContext* ctx);
+void VulkanRendererFrameGenSetDynamicTarget(float fps);
 #endif
 
 #ifdef __cplusplus

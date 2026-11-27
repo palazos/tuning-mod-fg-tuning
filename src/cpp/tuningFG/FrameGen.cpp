@@ -30,8 +30,13 @@ constexpr int      kMaxLevels   = 6;
 constexpr int      kMaxGen      = 4;
 // Frames of the next pair are written while the previous pair still has presents queued.
 constexpr int      kGenImages   = 10;
+// Presents one X++ Draw may queue. Below the panel refresh some are repeats
+// that keep an image on screen for its whole output period.
+constexpr int      kMaxQueue    = 6;
 // Extra presents one X++ Draw can have in flight, each with its own fence.
-constexpr int      kSide        = kMaxGen - 1;
+constexpr int      kSide        = kMaxQueue - 1;
+// Dynamic target: output refresh is the panel's divided by at most this.
+constexpr int      kMaxDivider  = 4;
 constexpr uint32_t kMinLevelDim = 24;  // coarsest pyramid level is at least this large
 constexpr uint32_t kBlock       = 8;   // motion block size in pixels of each level
 constexpr uint32_t kStamps      = 5;   // start, pyramid, motion, select, end
@@ -53,6 +58,16 @@ constexpr double   kSnapRefresh = 0.5;
 // is instead of a blend, without moving the timeline. About 3 ms at 60 Hz;
 // half a refresh (8 ms) read as a hitch on a turn.
 constexpr double   kRawRefresh  = 0.2;
+// Phase lock: the hold grows by less than one panel refresh so that real
+// frames land on output vsyncs and are shown as is. It needs a cadence that
+// repeats: unless kPhaseShare of recent frames fall within kPhaseTol of an
+// output period of the chosen phase, no extra hold is added. Uneven rates
+// spread over the whole period and stay unlocked; 30, 36, 40 and 45 fps on
+// 60 Hz lock.
+constexpr int      kPhaseSamples = 24;
+constexpr int      kPhaseMin     = 8;
+constexpr double   kPhaseShare   = 0.3;
+constexpr double   kPhaseTol     = 0.1;
 constexpr double   kMaxHoldMs   = 100.0;
 // Performance playout: the shown content time follows (vsync - hold) at a speed
 // within 1 +- kSpeedRange, correcting its error over about kCatchMs, so a change
@@ -93,6 +108,8 @@ constexpr double   kMaxLateIntervals = 1.25;
 constexpr float kContentAreaShare = 0.10f;
 
 std::atomic<int64_t> gVsyncNs{0};
+// Dynamic output rate chosen by the user, 0 for the panel refresh.
+std::atomic<float> gDynTargetHz{0.f};
 // Power saver X3: a still image (loading screens, menus) runs uncapped, since
 // some games load per frame and crawl at a third of the refresh. Residuals are
 // the mean motion-compensated luma error of a pair; the gap between the two
@@ -342,7 +359,18 @@ struct FrameGenState {
     bool   haveDynX = false, haveDynV = false;
     bool   dynStalled = false;  // stopped at the newest frame waiting for the next one
     VkDescriptorSet dynShown = VK_NULL_HANDLE;
+    // X++: last panel vsync queued. dynV is the last output vsync; with a
+    // divider the refreshes between two output vsyncs repeat the image.
+    Clock::time_point dynTail{};
+    bool   haveDynTail = false;
+    int    dynDiv = 1;  // output vsync every dynDiv panel refreshes
     double holdMs = 0.0;
+    // Phase lock: each real frame's content time relative to the output grid
+    // (dynV), in ms within one output period.
+    double phaseHist[kPhaseSamples] = {};
+    int    phaseCount = 0, phaseHead = 0;
+    double phaseRefMs = 0.0;  // output period the samples were taken with
+    double phaseMs = 0.0;     // extra hold in use, below one panel refresh
     int    stillCount = 0;
     Clock::time_point lastProbe{};
     void readScd(int slot);
@@ -450,6 +478,16 @@ struct FrameGenState {
     void updateContentClock(Clock::time_point arrival);
     double lateQuantile(Clock::time_point now) const;
     double vsyncPeriodMs() const { return 1000.0 / std::max(10.0f, targetHz.load()); }
+    // The target never goes above the panel refresh; a panel change re-derives it.
+    int outDivider() const {
+        const float hz = std::max(10.0f, targetHz.load());
+        const float fps = gDynTargetHz.load(std::memory_order_relaxed);
+        if (!(fps > 1.f) || fps >= hz) return 1;
+        return std::clamp((int)std::floor(hz / fps + 0.01f), 1, kMaxDivider);
+    }
+    double outPeriodMs() const { return dynDiv * vsyncPeriodMs(); }
+    void notePhase(Clock::time_point ct);
+    double lockPhase(double baseHold);
     // Java still has to acquire, so the present starts half a refresh early.
     // X++ already holds that image; the same lead shows one frame early and
     // the next one a refresh late.
@@ -459,8 +497,9 @@ struct FrameGenState {
     }
     void resetDyn() {
         dynCount = 0;
-        haveDynX = haveDynV = dynStalled = false;
+        haveDynX = haveDynV = haveDynTail = dynStalled = false;
         dynShown = VK_NULL_HANDLE;
+        phaseCount = 0;
     }
     // Keeps only this frame, shown as is.
     void restartDyn(int slot, Clock::time_point ct) {
@@ -468,8 +507,10 @@ struct FrameGenState {
         dynCount = 1;
         dynX = dynRealCt = ct;
         haveDynX = true;
-        haveDynV = dynStalled = false;
+        haveDynV = haveDynTail = dynStalled = false;
         dynShown = composeScene[slot];
+        // The next output grid may take the other parity.
+        if (dynDiv > 1) phaseCount = 0;
     }
     void dynDropOldest() {
         for (int i = 1; i < dynCount; ++i) dyn[i - 1] = dyn[i];
@@ -508,6 +549,21 @@ struct FrameGenState {
         const double p = vsyncPeriodMs();
         const double n = std::ceil(msBetween(base, t) / p);
         return base + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(n * p));
+    }
+    // Panel refreshes from the last output vsync to v, modulo the divider.
+    int outPhaseOf(Clock::time_point v) const {
+        if (dynDiv <= 1 || !haveDynV) return 0;
+        const long n = std::lround(msBetween(dynV, v) / vsyncPeriodMs());
+        return (int)(((n % dynDiv) + dynDiv) % dynDiv);
+    }
+    // First output vsync at or after t. It keeps the parity of dynV, so every
+    // image stays dynDiv refreshes on screen.
+    Clock::time_point outVsyncAtOrAfter(Clock::time_point base, Clock::time_point t) const {
+        const Clock::time_point v = vsyncAtOrAfter(base, t);
+        const int r = outPhaseOf(v);
+        if (r == 0) return v;
+        return v + std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double, std::milli>((dynDiv - r) * vsyncPeriodMs()));
     }
     // Least recently written slot not in use.
     int  pickSlot() const {
@@ -1960,8 +2016,8 @@ int FrameGenState::planPhases(double intervalNow, Clock::time_point arrival, flo
         for (int n = multiplier.load(); n >= 2 && want == 0; --n)
             if (ratio >= n / 1.08) want = n - 1;
     }
-    else if (kApplied == 1) want = src < kDynOffRatio * hz ? 1 : 0;
-    else want = src < kDynOnRatio * hz ? 1 : 0;
+    else if (kApplied == 1) want = src < kDynOffRatio * hz / dynDiv ? 1 : 0;
+    else want = src < kDynOnRatio * hz / dynDiv ? 1 : 0;
 
     // Switching the multiplier is visible as a hitch, so require a stable vote.
     const int votes = m != 1 ? 8 : (kApplied == 1 ? kDynOffVotes : kDynOnVotes);
@@ -1977,7 +2033,7 @@ int FrameGenState::planPhases(double intervalNow, Clock::time_point arrival, flo
     if (plan <= 0) return 0;
 
     // Performance interpolates once per vsync, not once per frame.
-    const double load = gpuMsEma + (m == 1 ? interpMsEma * intervalNow / vsyncPeriodMs() : 0.0);
+    const double load = gpuMsEma + (m == 1 ? interpMsEma * intervalNow / outPeriodMs() : 0.0);
     if (overloaded) {
         if (load < 0.45 * intervalNow) overloaded = false;
     } else if (load > 0.6 * intervalNow) {
@@ -2151,7 +2207,16 @@ bool FrameGenState::renderFrame(VulkanRendererContext* c) {
         kApplied = -1;
         kVotes = 0;
     }
-    if (m == 1) dynTrim();
+    if (m == 1) {
+        const int div = outDivider();
+        if (div != dynDiv) {
+            dynDiv = div;
+            resetDyn();
+            kApplied = -1;
+            kVotes = 0;
+        }
+        dynTrim();
+    }
 
     const auto arrival = Clock::now();
     // X++ aborts (a throw, or a return that skips endXpp) leave a signaled
@@ -2463,7 +2528,7 @@ FrameGenState::DynPick FrameGenState::dynPick(Clock::time_point v, double dv) co
     auto ms = [](double d) {
         return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(d));
     };
-    const double p = vsyncPeriodMs();
+    const double p = outPeriodMs();
     const DynFrame& last = dyn[dynCount - 1];
     const auto limit = last.ct + ms(kSnapRefresh * p);
     const auto desired = v - ms(holdMs);
@@ -2495,6 +2560,56 @@ FrameGenState::DynPick FrameGenState::dynPick(Clock::time_point v, double dv) co
     return r;
 }
 
+void FrameGenState::notePhase(Clock::time_point ct) {
+    const double pOut = outPeriodMs();
+    if (std::abs(pOut - phaseRefMs) > 0.01) {
+        phaseCount = 0;
+        phaseRefMs = pOut;
+    }
+    if (!haveDynV) return;
+    double r = std::fmod(msBetween(dynV, ct), pOut);
+    if (r < 0.0) r += pOut;
+    phaseHist[phaseHead] = r;
+    phaseHead = (phaseHead + 1) % kPhaseSamples;
+    phaseCount = std::min(phaseCount + 1, kPhaseSamples);
+}
+
+// x follows (v - hold), so a frame at ct is on screen as is when (ct + hold)
+// lands on an output vsync. Picks the extra hold, under one panel refresh,
+// that lands the most recent frames there. The shift that keeps the current
+// hold gets one extra point, so one noisy sample does not swap phases.
+double FrameGenState::lockPhase(double baseHold) {
+    const double pOut = outPeriodMs();
+    const double maxShift = vsyncPeriodMs();
+    const double tol = kPhaseTol * pOut;
+    auto offGrid = [&](double ms) {
+        double d = std::fmod(ms, pOut);
+        if (d < 0.0) d += pOut;
+        return std::min(d, pOut - d);
+    };
+    phaseMs = 0.0;
+    if (phaseCount < kPhaseMin) return phaseMs;
+    int bestHits = 0, bestScore = 0;
+    double best = 0.0;
+    for (int i = 0; i < phaseCount; ++i) {
+        double shift = pOut - std::fmod(phaseHist[i] + baseHold, pOut);
+        if (shift >= pOut) shift -= pOut;
+        if (shift >= maxShift) continue;
+        int hits = 0;
+        for (int j = 0; j < phaseCount; ++j)
+            if (offGrid(phaseHist[j] + baseHold + shift) <= tol) ++hits;
+        const int score = hits + (std::abs(baseHold + shift - holdMs) <= tol ? 1 : 0);
+        if (score > bestScore) {
+            bestScore = score;
+            bestHits = hits;
+            best = shift;
+        }
+    }
+    if (bestHits < kPhaseShare * phaseCount) return phaseMs;
+    phaseMs = best;
+    return phaseMs;
+}
+
 // Performance: motion is estimated once per real frame. Every vsync shows the
 // content time dynX (see dynPick). The game is not capped.
 // Java: returns when a new frame arrives or there is nothing newer to show.
@@ -2507,6 +2622,7 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(v));
     };
     const double p = vsyncPeriodMs();
+    const double pOut = outPeriodMs();
     const double lead = presentLeadMs();
     pyrValid[slot] = false;
 
@@ -2584,6 +2700,7 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         const bool cut = msBetween(dyn[dynCount - 1].ct, contentTime) > kMaxMorphMs;
         DynFrame f{slot, contentTime, !cut, cut, !cut};
         if (cut) haveFieldPrev = false;
+        else notePhase(contentTime);
         dyn[dynCount++] = f;
         // One content interval of hold: the next frame is already captured
         // when this one is shown, so the refreshes between them keep moving.
@@ -2592,7 +2709,8 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         const double cover = clockIvMs > 0.0 ? clockIvMs : lateMs;
         const double late = std::min(std::max(lateMs, cover), kMaxLateIntervals * cover);
         const double pipe = holdSlot ? gpuMsEma + interpMsEma : 0.0;
-        holdMs = std::min(late + lead + pipe + kQueueMs, kMaxHoldMs);
+        const double baseHold = std::min(late + lead + pipe + kQueueMs, kMaxHoldMs);
+        holdMs = std::min(baseHold + lockPhase(baseHold), kMaxHoldMs);
     }
 
     int made = 0;
@@ -2612,8 +2730,8 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         }
         dynStalled = false;
         dynX = pk.x;
-        dynV = v;
-        haveDynX = haveDynV = true;
+        dynV = dynTail = v;
+        haveDynX = haveDynV = haveDynTail = true;
         const double added = std::max(0.0, msBetween(pk.x, v) - 0.5 * p - kLatchMs);
         latencyEma = latencyEma > 0.0 ? latencyEma * 0.95 + added * 0.05 : added;
     };
@@ -2633,9 +2751,30 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
         const double untilFrame = std::max(0.0, iv - msBetween(lastArrival, now));
         const auto end = vsyncAtOrAfter(base, now + ms(untilFrame + lead));
         Clock::time_point v = vsyncAtOrAfter(base, now + ms(lead));
-        if (haveDynV) v = std::max(v, nearestVsync(base, dynV + ms(p)));
-        for (int step = 0; step < kMaxGen && (step == 0 || v < end); ++step) {
-            const double dv = haveDynV && !dynStalled ? std::max(p, msBetween(dynV, v)) : p;
+        if (haveDynTail) v = std::max(v, nearestVsync(base, dynTail + ms(p)));
+        auto queue = [&](VkDescriptorSet ds) {
+            if (heldAcquire) return present(ds);
+            if (!presentSide(c, ds, fb, cursorUpload, waitScene ? sceneDone : VK_NULL_HANDLE))
+                return false;
+            waitScene = false;
+            cursorUpload = false;
+            dynShown = ds;
+            return true;
+        };
+        for (int step = 0; step < kMaxQueue && (step == 0 || v < end); ++step) {
+            if (dynShown != VK_NULL_HANDLE && outPhaseOf(v) != 0) {
+                // Between two output vsyncs the image stays. FIFO shows the next
+                // queued present on the following refresh, so a later image
+                // needs these repeats in front of it.
+                if (step > 0 && outVsyncAtOrAfter(base, v) >= end) break;
+                if (!queue(dynShown)) break;
+                if (outCount > 0) --outCount;  // the HUD counts distinct images
+                dynTail = v;
+                haveDynTail = true;
+                v = nearestVsync(base, v + ms(p));
+                continue;
+            }
+            const double dv = haveDynV && !dynStalled ? std::max(pOut, msBetween(dynV, v)) : pOut;
             DynPick pk = dynPick(v, dv);
             const DynFrame& a = dyn[pk.fi - 1];
             const DynFrame& f = dyn[pk.fi];
@@ -2659,7 +2798,10 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
                 }
                 // The FIFO keeps showing it; queuing it again only adds depth.
                 // The held image still has to be presented.
-                if (step == 0 && heldAcquire) present(ds);
+                if (step == 0 && heldAcquire && present(ds)) {
+                    dynTail = v;
+                    haveDynTail = true;
+                }
                 break;
             }
             if (!pk.real) {
@@ -2669,16 +2811,7 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
                 ds = composeGen[genImg];
                 submitInterp(c, a.slot, f.slot, pk.t, genImg);
             }
-            bool shown = false;
-            if (heldAcquire) {
-                shown = present(ds);
-            } else if (presentSide(c, ds, fb, cursorUpload, waitScene ? sceneDone : VK_NULL_HANDLE)) {
-                waitScene = false;
-                cursorUpload = false;
-                dynShown = ds;
-                shown = true;
-            }
-            if (!shown) break;
+            if (!queue(ds)) break;
             noteShown(pk, v);
             v = nearestVsync(base, v + ms(p));
         }
@@ -2695,13 +2828,13 @@ bool FrameGenState::renderDynamic(VulkanRendererContext* c, const FrameBuild& fb
             break;
         }
         const auto now = Clock::now();
-        Clock::time_point v = haveDynV ? nearestVsync(base, dynV + ms(p))
+        Clock::time_point v = haveDynV ? nearestVsync(base, dynV + ms(pOut))
                                        : vsyncAtOrAfter(base, now + ms(lead));
         // A vsync is skipped only when this present cannot reach it.
         const double minAhead = kLatchMs + 2.0 + interpMsEma;
-        if (msBetween(now, v) < minAhead) v = vsyncAtOrAfter(base, now + ms(minAhead));
+        if (msBetween(now, v) < minAhead) v = outVsyncAtOrAfter(base, now + ms(minAhead));
 
-        const double dv = haveDynV && !dynStalled ? std::max(p, msBetween(dynV, v)) : p;
+        const double dv = haveDynV && !dynStalled ? std::max(pOut, msBetween(dynV, v)) : pOut;
         const DynPick pk = dynPick(v, dv);
         const DynFrame& a = dyn[pk.fi - 1];
         const DynFrame& f = dyn[pk.fi];
@@ -2859,6 +2992,10 @@ FrameGenStats FG_HOOK(GetStats)(VulkanRendererContext* c) {
 
 void FG_HOOK(NoteVsync)(int64_t frameTimeNs) {
     gVsyncNs.store(frameTimeNs, std::memory_order_relaxed);
+}
+
+void FG_HOOK(SetDynamicTarget)(float fps) {
+    gDynTargetHz.store(fps > 0.f ? fps : 0.f, std::memory_order_relaxed);
 }
 
 bool FG_HOOK(SourceUncapped)() {
